@@ -1,0 +1,350 @@
+/*
+ *  MQTT Dimmer
+ *
+ *  This firmware is meant to control PWM outputs from a PIC and report switch status through MQTT.
+ *  Based on MQTT switch by Jan Penninkhof <jan@penninkhof.com>
+ *  The ESP8266 will register itself with the MQTT broker and will listen to topics listed the config
+ *  Inbound message are expected to be formatted as JSON messages
+ *  and will be parsed for switching instruction. Please find a valid JSON instruction
+ *  below:
+ *
+ *  {"deviceOn":<true/false>}
+ *  {"deviceSetting":<int>} Int should be a number between 0 and 100 (right now it is 255)
+ *  {"deviceAdjustNum":<int>} Int should be a number between 0 and 100
+ *  {"deviceAdjust":<"up"/"down">}
+ *
+ *  If one of the switch inputs changes states, an MQTT message is published to the appropriate topic:\
+ *
+ *  {"switch": <"on"/"off">}
+ *
+ *  The switch inputs (GPIO 4 and 5) are internally pulled up, and should be connected to GND via 
+ *  switches
+ *
+ *  The PIC is connected to ESP HSPI pins. Upon receiving a control message, the ESP writes the 
+ *  PWM address byte (1 or 2) and the setting byte (received deviceSetting). A delay is needed to wait 
+ *  for the PIC to complete the setting operation - no handshake is done (and I am out of pins to 
+ *  implement one). 
+ *
+ *  The PIC is reset after HSPI initialization by pulling the MCLR pin low.
+ *  
+ *  There is also an auto configuration function. If the switch is in a default state, it will publish
+ *  its device ID to /discovery. A configuration server can then post to /<device ID> with configuration 
+ *  information (see below for valid config parameters). The new config will be saved to flash and the 
+ *  device will no longer post to /discovery. New configurations can still be sent.
+ *  {'mqtt_topic_pwm1':<pwm1 topic>}
+ *  {'mqtt_topic_pwm2':<pwm2 topic>}
+ *  {'mqtt_topic_sw1':<sw1 topic>}
+ *  {'mqtt_topic_sw2':<sw2 topic>}
+ *  {'mqtt_host':<mqtt host>}
+ *  {'mqtt_port':<mqtt port>}
+ *  {'mqtt_user':<mqtt user>}
+ *  {'mqtt_pass':<mqtt password>}
+ *  {'sta_ssid':<WiFi SSID>}
+ *  {'sta_pass':<WiFi password>}
+ *
+ */
+#include "ets_sys.h"
+#include "driver/uart.h"
+#include "osapi.h"
+#include "mqtt.h"
+#include "wifi.h"
+#include "config.h"
+#include "debug.h"
+#include "gpio.h"
+#include "user_interface.h"
+#include "mem.h"
+#include "driver/spi.h"
+
+void ICACHE_FLASH_ATTR pwm_control(char* data_buf, uint8_t topicInd);
+void ICACHE_FLASH_ATTR send_status();
+
+MQTT_Client mqttClient;
+uint8_t dOn[2] = {0,0};
+uint8_t dSet[2] = {0,0};
+
+void ICACHE_FLASH_ATTR
+wifi_connect_cb(uint8_t status)
+{
+	if(status == STATION_GOT_IP){
+		MQTT_Connect(&mqttClient);
+	} else {
+		MQTT_Disconnect(&mqttClient);
+	}
+}
+
+void ICACHE_FLASH_ATTR
+mqtt_connected_cb(uint32_t *args)
+{
+	MQTT_Client* client = (MQTT_Client*)args;
+	INFO("MQTT: Connected\r\n");
+	//if discovery flag is set, publish device ID to discovery topic
+	if(config.discovery_flag == 1) {
+	MQTT_Publish(client, config.mqtt_topic_discovery, config.device_id, 
+			os_strlen(config.device_id)+1, 2, 0);
+	}
+	MQTT_Subscribe(client, config.mqtt_topic_config, 0);
+	INFO("MQTT: Subcribed to %s\r\n", config.mqtt_topic_config);
+	MQTT_Subscribe(client, config.mqtt_topic_pwm1, 0);
+	INFO("MQTT: Subcribed to %s\r\n", config.mqtt_topic_pwm1);
+	MQTT_Subscribe(client, config.mqtt_topic_pwm2, 0);
+	INFO("MQTT: Subcribed to %s\r\n", config.mqtt_topic_pwm2);
+}
+
+void ICACHE_FLASH_ATTR
+mqtt_disconnected_cb(uint32_t *args)
+{
+	MQTT_Client* client = (MQTT_Client*)args;
+	INFO("MQTT: Disconnected\r\n");
+}
+
+void ICACHE_FLASH_ATTR
+mqtt_published_cb(uint32_t *args)
+{
+	MQTT_Client* client = (MQTT_Client*)args;
+	INFO("MQTT: Published\r\n");
+}
+
+void ICACHE_FLASH_ATTR
+mqtt_data_cb(uint32_t *args, const char* topic, uint32_t topic_len, const char *data, uint32_t data_len)
+{
+	uint8_t topicInd = 2;
+		
+	char *topic_buf = (char*)os_zalloc(topic_len+1),
+		 *data_buf  = (char*)os_zalloc(data_len+1);
+	MQTT_Client* client = (MQTT_Client*)args;
+
+	os_memcpy(topic_buf, topic, topic_len);
+	topic_buf[topic_len] = 0;
+
+	os_memcpy(data_buf, data, data_len);
+	data_buf[data_len] = 0;
+	
+
+	INFO("MQTT: Received data on topic: %s\r\n", topic_buf);
+	INFO("MQTT msg: %s\r\n", data_buf);
+	//update config
+	if (!strcmp(topic_buf, config.mqtt_topic_config)) {mqtt_config(data_buf);}
+	else if (!strcmp(topic_buf, config.mqtt_topic_pwm1)) {topicInd = PWM1;}
+	else if (!strcmp(topic_buf, config.mqtt_topic_pwm2)) {topicInd = PWM2;}
+	if (topicInd==PWM1 || topicInd==PWM2) {pwm_control(data_buf, topicInd);}
+		  
+		 
+	os_free(topic_buf);
+	os_free(data_buf);
+
+	
+}
+
+void ICACHE_FLASH_ATTR
+pwm_control(char* data_buf, uint8_t topicInd)
+{
+	
+	uint8_t dAdj = DEFAULT_ADJUST;
+	uint8_t adjFlag = 0;
+	char * pch;
+	pch = strtok (data_buf,DELIMITER);
+
+	while (pch != NULL)
+	{
+	    	if (!strcmp(pch,"deviceOn")) {
+			pch = strtok (NULL, DELIMITER);
+			if(!strcmp(pch,"true")) {dOn[topicInd] = 1;}
+			else if(!strcmp(pch,"false")) {dOn[topicInd] = 0;}
+		} else if (!strcmp(pch,"deviceSetting")) {
+			pch = strtok (NULL, DELIMITER);		
+			dSet[topicInd] = atoi(pch);
+		} else if (!strcmp(pch,"deviceAdjustNum")) {
+			pch = strtok (NULL, DELIMITER);
+			dAdj = atoi(pch);
+		} else if (!strcmp(pch,"deviceAdjust")) {
+			pch = strtok (NULL, DELIMITER);
+			if(!strcmp(pch,"up")) {adjFlag = 1;}
+			else if(!strcmp(pch,"down")) {adjFlag = 2;}
+		}
+		pch = strtok (NULL, DELIMITER);
+	}
+	if(adjFlag == 1) {dSet[topicInd] += dAdj;}
+	else if(adjFlag == 2) {dSet[topicInd] -= dAdj;}
+	//write to PIC
+	INFO("Writing to %d SPI: %d\r\n", topicInd,dOn[topicInd]*dSet[topicInd]);
+    	spi_tx8(HSPI,topicInd);
+	os_delay_us(5000);
+	spi_tx8(HSPI,dOn[topicInd]*dSet[topicInd]);
+	send_status();
+	//os_delay_us(1280000);
+	os_free(pch);
+	os_free(dAdj);
+	os_free(adjFlag);
+
+}
+
+
+void ICACHE_FLASH_ATTR
+sw_interrupt() {
+	ETS_GPIO_INTR_DISABLE(); // Disable gpio interrupts
+	// Debounce
+	os_delay_us(200000);
+	uint32 gpio_status;
+	gpio_status = GPIO_REG_READ(GPIO_STATUS_ADDRESS);
+	char *json_buf = (char*)os_zalloc(20), *data_buf  = (char*)os_zalloc(20);
+	uint8_t topicInd = 2;
+	// Button interrupt received
+	if (gpio_status & BIT(4))
+	{
+		uint8_t sw = GPIO_INPUT_GET(SW1_GPIO);
+		topicInd = PWM1;
+		INFO("SW1: Switch input\r\n");
+		INFO("SW1 GPIO: %d\r\n",sw);
+		if (!sw) {
+			INFO("SW1: Switch off\r\n");
+			strcpy(json_buf,"{\"switch\": \" off\"}");
+			strcpy(data_buf,"{\"deviceOn\": false}");
+		} else  {
+			INFO("SW1: Switch on\r\n");
+			strcpy(json_buf,"{\"switch\": \" on\"}");
+			strcpy(data_buf,"{\"deviceOn\": true}");
+		}
+		// Send new status to the MQTT broker
+
+		INFO("SW2: Sending current switch status\r\n");
+		MQTT_Publish(&mqttClient, config.mqtt_topic_sw1, json_buf, strlen(json_buf), 2, 1);	
+		
+	} else if (gpio_status & BIT(5))
+	{
+		uint8_t sw = GPIO_INPUT_GET(SW2_GPIO);
+		topicInd = PWM2;
+		INFO("SW2: Switch input\r\n");
+		INFO("SW2 GPIO: %d\r\n",sw);
+		if (!sw) {
+			INFO("SW2: Switch off\r\n");
+			strcpy(json_buf,"{\"switch\": \" off\"}");
+			strcpy(data_buf,"{\"deviceOn\": false}");
+		} else  {
+			INFO("SW2: Switch on\r\n");
+			strcpy(json_buf,"{\"switch\": \" on\"}");
+			strcpy(data_buf,"{\"deviceOn\": true}");
+		}
+	
+		// Send new status to the MQTT broker
+
+		INFO("SW2: Sending current switch status\r\n");
+		MQTT_Publish(&mqttClient, config.mqtt_topic_sw2, json_buf, strlen(json_buf), 2, 1);
+		
+		
+	}
+	INFO("In SW_int function: %s \r\n", data_buf);
+	pwm_control(data_buf, topicInd);
+	os_free(json_buf);
+	os_free(data_buf);
+	os_free(topicInd);
+	// Clear interrupt status
+	GPIO_REG_WRITE(GPIO_STATUS_W1TC_ADDRESS, gpio_status);
+	ETS_GPIO_INTR_ENABLE(); // Enable gpio interrupts
+}
+//add decl
+void ICACHE_FLASH_ATTR
+send_status() {
+	char *json_buf = (char*)os_zalloc(512);
+	char *temp_buf = (char*)os_zalloc(128);
+	char *pwm1_on = (char*)os_zalloc(5);
+	char *pwm2_on = (char*)os_zalloc(5);
+	char *sw1_on = (char*)os_zalloc(5);
+	char *sw2_on = (char*)os_zalloc(5);
+	if(dOn[0]){strcpy(pwm1_on,"true");}
+	else {strcpy(pwm1_on,"false");}
+	if(dOn[1]){strcpy(pwm2_on,"true");}
+	else {strcpy(pwm2_on,"false");}
+	if(GPIO_INPUT_GET(SW1_GPIO)){strcpy(sw1_on,"true");}
+	else {strcpy(sw1_on,"false");}
+	if(GPIO_INPUT_GET(SW2_GPIO)){strcpy(sw2_on,"true");}
+	else {strcpy(sw2_on,"false");}
+	//create formated json status
+	strcpy(json_buf,"{\"online\":true,"); //if we are posting status, we are online
+	os_sprintf(temp_buf,"\"%s\":{\"setting\":%d,\"on\":%s},", config.mqtt_topic_pwm1, dSet[0], pwm1_on);
+	strcat(json_buf,temp_buf);
+	os_sprintf(temp_buf,"\"%s\":{\"setting\":%d,\"on\":%s},", config.mqtt_topic_pwm2, dSet[1], pwm2_on);
+	strcat(json_buf,temp_buf);
+	os_sprintf(temp_buf,"\"%s\":%s,", config.mqtt_topic_sw1, sw1_on);
+	strcat(json_buf,temp_buf);
+	os_sprintf(temp_buf,"\"%s\":%s", config.mqtt_topic_sw2, sw2_on);
+	strcat(json_buf,temp_buf);
+	strcat(json_buf,"}");
+	MQTT_Publish(&mqttClient, config.mqtt_topic_status, json_buf, strlen(json_buf), 2, 1);
+	os_free(json_buf);
+	os_free(temp_buf);
+	os_free(pwm1_on);
+	os_free(pwm2_on);
+	os_free(sw1_on);
+	os_free(sw2_on);
+}
+
+void ICACHE_FLASH_ATTR
+gpio_init() {
+	//Configure SPI
+	spi_init(HSPI);
+	spi_mode(HSPI, 0, 0);
+	INFO("\r\nInitialized SPI ...\r\n");
+
+	// Configure MCLR output (PIC reset)
+	PIN_FUNC_SELECT(MCLR_GPIO_MUX, MCLR_GPIO_FUNC);
+	GPIO_OUTPUT_SET(MCLR_GPIO, 0);
+	os_delay_us(10000);
+	GPIO_OUTPUT_SET(MCLR_GPIO, 1);
+
+	// Configure push button
+	ETS_GPIO_INTR_DISABLE(); // Disable gpio interrupts
+
+	//SW1
+	ETS_GPIO_INTR_ATTACH(sw_interrupt, SW1_GPIO);  // GPIO interrupt handler
+	PIN_FUNC_SELECT(SW1_GPIO_MUX, SW1_GPIO_FUNC); // Set function
+	GPIO_DIS_OUTPUT(SW1_GPIO); // Set as input
+	PIN_PULLUP_EN(SW1_GPIO_MUX);
+	gpio_pin_intr_state_set(GPIO_ID_PIN(SW1_GPIO), 3); // Interrupt on edge
+	
+	//SW2
+	ETS_GPIO_INTR_ATTACH(sw_interrupt, SW2_GPIO);  // GPIO0 interrupt handler
+	PIN_FUNC_SELECT(SW2_GPIO_MUX, SW2_GPIO_FUNC); // Set function
+	GPIO_DIS_OUTPUT(SW2_GPIO); // Set as input
+	PIN_PULLUP_EN(SW2_GPIO_MUX);
+	gpio_pin_intr_state_set(GPIO_ID_PIN(SW2_GPIO), 3); // Interrupt on edge	
+
+	ETS_GPIO_INTR_ENABLE(); // Enable gpio interrupts
+
+	
+
+}
+
+void ICACHE_FLASH_ATTR
+mqtt_init() {
+	MQTT_InitConnection(&mqttClient, config.mqtt_host, config.mqtt_port, config.security);
+	MQTT_InitClient(&mqttClient, config.device_id, config.mqtt_user, config.mqtt_pass, config.mqtt_keepalive, 1);
+	MQTT_InitLWT(&mqttClient, config.mqtt_topic_status, "{\"online\":false}", 2,1);
+	MQTT_OnConnected(&mqttClient, mqtt_connected_cb);
+	MQTT_OnDisconnected(&mqttClient, mqtt_disconnected_cb);
+	MQTT_OnPublished(&mqttClient, mqtt_published_cb);
+	MQTT_OnData(&mqttClient, mqtt_data_cb);
+}
+
+void ICACHE_FLASH_ATTR
+user_init(void)
+{
+	uart_init(BIT_RATE_115200, BIT_RATE_115200);
+	INFO("\r\nSDK version: %s\n", system_get_sdk_version());
+	INFO("System init...\r\n");
+	system_set_os_print(1);
+	os_delay_us(1000000);
+
+	config_load();
+	gpio_init();
+	mqtt_init();
+
+	WIFI_Connect(config.sta_ssid, config.sta_pwd, wifi_connect_cb);
+
+	INFO("\r\nSystem started ...\r\n");
+}
+
+void ICACHE_FLASH_ATTR
+ICACHE_FLASH_ATTRuser_rf_pre_init(void) {
+	
+
+}

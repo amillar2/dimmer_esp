@@ -1,7 +1,7 @@
 #ifndef _USER_CONFIG_H_
 #define _USER_CONFIG_H_
 
-#define CFG_HOLDER	0x00FF553	/* Change this value to load default configurations */
+#define CFG_HOLDER	0x00FF557	/* Change this value to load default configurations */
 #define CFG_LOCATION	0x3C	/* Please don't change or if you know what you doing */
 #define CLIENT_SSL_ENABLE
 #define DELIMITER	"'{\":, }\n"
@@ -14,20 +14,20 @@
 #define MQTT_KEEPALIVE		120	 /*second*/
 
 #define MQTT_CLIENT_ID		"DeviceX_%08X"
-#define MQTT_TOPIC_CONFIG		"/config"
-#define MQTT_TOPIC_STATUS		"/DeviceX_%08X/status"
+#define MQTT_TOPIC_CONFIG		"DeviceX_%08X/config"
+#define MQTT_TOPIC_STATUS		"DeviceX_%08X/status"
 		
-#define MQTT_TOPIC_PWM1			"/kitchen/light"
-#define MQTT_TOPIC_PWM2			"/living/light"
-#define MQTT_TOPIC_SW1			"/kitchen/switch"
-#define MQTT_TOPIC_SW2			"/living/switch"
-#define MQTT_TOPIC_DISCOVERY		"/discovery"
+#define MQTT_TOPIC_PWM1			"kitchen/light"
+#define MQTT_TOPIC_PWM2			"living/light"
+#define MQTT_TOPIC_SW1			"kitchen/switch"
+#define MQTT_TOPIC_SW2			"living/switch"
+#define MQTT_TOPIC_DISCOVERY		"discovery"
 
 #define MQTT_USER			"test"
 #define MQTT_PASS			"testpass"
 
-#define STA_SSID "LL Cool L 2p4"
-#define STA_PASS "<pass>"
+#define STA_SSID ""
+#define STA_PASS ""
 #define STA_TYPE AUTH_WPA2_PSK
 
 #define MQTT_RECONNECT_TIMEOUT 	5	/*second*/

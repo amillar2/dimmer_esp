@@ -168,7 +168,7 @@ pwm_control(char* data_buf, uint8_t topicInd)
 	//write to PIC
 	INFO("Writing to %d SPI: %d\r\n", topicInd,dOn[topicInd]*dSet[topicInd]);
     	spi_tx8(HSPI,topicInd);
-	os_delay_us(5000);
+	os_delay_us(10000);
 	spi_tx8(HSPI,dOn[topicInd]*dSet[topicInd]);
 	send_status();
 	//os_delay_us(1280000);
